@@ -1,0 +1,2 @@
+# SelfCoach
+claude code projects
