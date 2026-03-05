@@ -1,0 +1,389 @@
+================================================================================
+PRODUCT REQUIREMENTS DOCUMENT
+SelfCoach — AI-Powered Athlete Movement Capture
+Version: 1.0 | Platform: Flutter (iOS + Android) | Audience: Agentic Coding
+================================================================================
+
+--------------------------------------------------------------------------------
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+SelfCoach is a cross-platform Flutter mobile app that uses the device front
+camera to passively monitor an athlete and automatically record video clips
+when movement is detected. The goal is hands-free, intelligent clip capture
+so athletes can review their form without a dedicated camera operator.
+
+Primary Use Case:
+  - Athlete props phone against a surface or stand
+  - App monitors via front camera
+  - When athlete begins a movement (e.g. squat, punch, swing), app auto-records
+  - Short clips are saved to local storage for review
+
+--------------------------------------------------------------------------------
+2. TECHNICAL DESIGN
+--------------------------------------------------------------------------------
+
+2.1 Stack & Dependencies
+------------------------
+Framework:      Flutter (Dart)
+Min SDK:        iOS 14+, Android 8.0 (API 26)+
+Camera:         camera (pub.dev/packages/camera)
+ML/Motion:      google_mlkit_pose_detection (pose landmark detection)
+Video Storage:  path_provider + local file system (no cloud in v1)
+State Mgmt:     Riverpod (preferred) or Bloc
+Permissions:    permission_handler
+
+2.2 Architecture
+----------------
+lib/
+  main.dart
+  app/
+    app.dart                  # MaterialApp root, routing
+    router.dart               # GoRouter config
+  features/
+    onboarding/
+      tutorial_screen.dart    # Mandatory first-launch tutorial (step-by-step)
+    camera/
+      camera_controller.dart  # Wraps Flutter camera plugin
+      camera_preview_widget.dart
+    motion_detection/
+      motion_detector.dart    # Frame analysis, pose detection pipeline
+      motion_state.dart       # Enum: idle | athlete_absent | monitoring | recording
+      frame_buffer.dart       # Circular buffer for pre-trigger video cache
+    recording/
+      clip_recorder.dart      # Start/stop video recording logic
+      clip_metadata.dart      # Model: timestamp, duration, file path, name, tags
+    gallery/
+      clip_gallery_screen.dart
+      clip_tile_widget.dart
+      clip_rename_tag_sheet.dart  # Bottom sheet for rename/tag (gallery + playback)
+    playback/
+      clip_playback_screen.dart
+  shared/
+    permissions/
+      permission_handler_service.dart
+    storage/
+      local_storage_service.dart
+
+2.3 Motion Detection Logic
+--------------------------
+Detection Method: velocity-based pose landmark analysis via MLKit.
+
+Frame Analysis:
+- Pull frames from camera stream at ~15 fps (not full 30fps, to save battery)
+- Run MLKit pose detection on each frame to extract 33 body landmarks
+- Compute per-landmark velocity: displacement (pixels) / time (ms) between frames
+
+Athlete-in-Frame Requirement:
+- ALL major landmarks must be detected with sufficient confidence before
+  triggering is enabled (full body required: head, shoulders, hips, knees, feet)
+- If any required landmarks are missing, enter ATHLETE_ABSENT state:
+    - Show "Step into frame" prompt overlay on camera preview
+    - Suppress all trigger evaluation
+    - Resume trigger evaluation automatically when full body re-detected
+- If athlete leaves mid-session, return to ATHLETE_ABSENT state immediately
+
+Motion Trigger Criteria (velocity-based):
+A trigger fires when ANY of the following velocity thresholds are exceeded
+across N consecutive frames:
+
+  1. Rapid limb velocity (wrist or ankle relative to corresponding shoulder/hip):
+     - Wrist velocity relative to shoulder > LIMB_VELOCITY_THRESHOLD
+     - Ankle velocity relative to hip > LIMB_VELOCITY_THRESHOLD
+     - Captures: punches, swings, kicks, throws, Olympic lifts
+
+  2. Rapid shoulder rotation (horizontal plane):
+     - Angular velocity of shoulder-to-shoulder axis > ROTATION_THRESHOLD
+     - Captures: golf swings, baseball swings, discus throws, pitching
+
+  3. Rapid hip rotation (horizontal plane):
+     - Angular velocity of hip-to-hip axis > ROTATION_THRESHOLD
+     - Captures: rotational power movements across all sports
+
+  4. Rapid arm abduction/flexion (arm rotating about shoulder joint):
+     - Angular velocity of upper arm about shoulder > ARM_ROTATION_THRESHOLD
+     - Captures: overhead throws, shot put, snatch, clean & jerk
+
+Pre-Trigger Buffer:
+- Maintain a continuous circular video buffer of PRE_TRIGGER_BUFFER_SEC
+  (default 1.5s, user-configurable)
+- On trigger: clip starts from buffer head (1.5s before trigger)
+- Continue recording until movement ceases + POST_TRIGGER_BUFFER_SEC elapses
+- POST_TRIGGER_BUFFER_SEC default 1.5s, user-configurable
+- Movement "ceases" when all velocity metrics drop below thresholds for
+  MOTION_END_DEBOUNCE_SEC (default 0.5s)
+
+Clip Lifecycle:
+- On trigger: begin writing pre-buffer + live stream to .mp4 file
+- On motion end + post-buffer: finalize file, save metadata, show toast
+- Discard clip if total duration < MIN_CLIP_DURATION_SEC
+
+Key Thresholds (all configurable via Settings):
+  MOTION_SENSITIVITY          float 0.0–1.0, default 0.5 (scales all thresholds)
+  LIMB_VELOCITY_THRESHOLD     derived from MOTION_SENSITIVITY
+  ROTATION_THRESHOLD          derived from MOTION_SENSITIVITY
+  ARM_ROTATION_THRESHOLD      derived from MOTION_SENSITIVITY
+  PRE_TRIGGER_BUFFER_SEC      float, default 1.5
+  POST_TRIGGER_BUFFER_SEC     float, default 1.5
+  MIN_CLIP_DURATION_SEC       int, default 2
+  MAX_CLIP_DURATION_SEC       int, default 30
+  MOTION_END_DEBOUNCE_SEC     float, default 0.5
+
+2.4 Permissions
+---------------
+Required:
+  - camera (front-facing)
+  - microphone (optional, for audio in clips)
+  - storage / media library (save clips)
+
+Always request permissions at runtime before entering camera view.
+If denied, show a clear explanation screen with a "Open Settings" CTA.
+
+2.5 Data Model
+--------------
+VideoClip {
+  id:             String (UUID)
+  filePath:       String
+  thumbnailPath:  String
+  createdAt:      DateTime
+  durationMs:     int
+  name:           String (default: "Clip — {date} {time}")
+  tags:           List<String> (free-form, default: empty)
+}
+
+Persist clip index as JSON to app documents directory using path_provider.
+
+2.6 Camera Behavior
+-------------------
+- Use front camera exclusively in v1
+- Lock orientation to portrait during capture session
+- Full-screen live camera preview at all times while on monitor screen
+- Persistent semi-transparent UI bar overlaid on preview (never hidden):
+    - Top bar: app logo, settings icon
+    - Bottom bar: Start/Stop Monitoring button, Gallery shortcut, motion status badge
+- Motion status badge states:
+    - "Step into frame" (pulsing amber) — athlete absent or not fully detected
+    - "Monitoring..." (pulsing green) — athlete in frame, awaiting trigger
+    - "● REC" (solid red) — recording in progress
+- Disable screen sleep while monitoring is active (wakelock_plus)
+
+--------------------------------------------------------------------------------
+3. USAGE EXAMPLES
+--------------------------------------------------------------------------------
+
+Example A — First Launch
+  1. User opens app → mandatory tutorial screen appears
+  2. User steps through 5 tutorial slides
+  3. Taps "Get Started" → lands on Camera Monitor screen
+
+Example B — Basic Happy Path
+  1. User taps "Start Monitoring"
+  2. App requests permissions if needed
+  3. Athlete not yet in frame → "Step into frame" prompt shown (amber badge)
+  4. Athlete steps fully into frame → badge changes to pulsing green "Monitoring..."
+  5. Athlete performs a golf swing
+  6. Trigger fires → pre-buffer (1.5s before swing) + live recording begins
+  7. Badge changes to red "● REC"
+  8. Swing ends → 1.5s post-buffer elapses → recording stops
+  9. Toast: "Clip saved (4.8s)" → clip appears in gallery
+  10. User taps "Stop Monitoring" → returns to idle
+
+Example C — Athlete Leaves Frame Mid-Session
+  1. App is in "Monitoring..." state
+  2. Athlete steps out of frame
+  3. "Step into frame" prompt returns immediately
+  4. Trigger evaluation suppressed
+  5. Athlete returns to frame → "Monitoring..." resumes automatically
+
+Example D — Rename & Tag a Clip
+  1. User opens Gallery
+  2. Long-presses a clip tile → options appear
+  3. Taps "Rename/Tag" → bottom sheet opens
+  4. Types new name: "Snatch attempt 3"
+  5. Adds tags: "snatch", "weightlifting", "needs work"
+  6. Taps Save → tile updates immediately
+
+Example E — Permissions Denied
+  - User denies camera permission
+  - App shows: "Camera access is required to monitor movement.
+    Please enable it in Settings."
+  - "Open Settings" button deep-links to device app settings
+
+Example F — Long Session
+  - Athlete monitors for 45 minutes
+  - App captures ~12 clips with pre/post buffers intact
+  - All saved locally; gallery accessible offline
+
+--------------------------------------------------------------------------------
+4. SCREENS & NAVIGATION
+--------------------------------------------------------------------------------
+
+Screen 0: Tutorial (first launch only, mandatory)
+  - Step-by-step visual walkthrough of app flow
+  - Steps (suggested):
+      1. Prop your phone so the camera faces you
+      2. Tap "Start Monitoring" — the app watches for movement
+      3. Step fully into frame — you'll see "Monitoring..." when ready
+      4. Perform your movement — the app auto-records
+      5. Find your clips in the Gallery
+  - "Next" / "Back" navigation between steps
+  - Final step has "Get Started" CTA that navigates to Screen 1
+  - NOT skippable on first launch
+  - Re-accessible from Settings
+
+Screen 1: Home / Camera Monitor
+  - Full-screen camera preview
+  - Persistent semi-transparent top bar: app logo, settings icon
+  - Persistent semi-transparent bottom bar: Start/Stop Monitoring button,
+    Gallery shortcut, motion status badge
+  - Center overlay (when ATHLETE_ABSENT): "Step into frame" prompt
+
+Screen 2: Gallery
+  - Grid or list of saved clips, newest first
+  - Each tile: thumbnail, clip name, duration, timestamp, tag pills
+  - Tap tile → Clip Playback
+  - Long-press tile → options: Rename/Tag, Delete (with confirmation dialog)
+  - Inline rename/tag via bottom sheet (clip_rename_tag_sheet)
+
+Screen 3: Clip Playback
+  - Full-screen video player with playback controls
+  - Back button, delete button (with confirmation)
+  - Show clip name, tags, date, duration
+  - Edit button → opens rename/tag bottom sheet
+
+Screen 4: Settings
+  - Motion Sensitivity slider (0.0–1.0)
+  - Pre-trigger buffer duration (seconds)
+  - Post-trigger buffer duration (seconds)
+  - Min / Max clip duration inputs
+  - Toggle: Save audio with clips
+  - Button: View Tutorial
+  - Button: Clear all clips (with confirmation)
+
+--------------------------------------------------------------------------------
+5. TESTING PLAN
+--------------------------------------------------------------------------------
+
+5.1 Unit Tests (test/)
+-----------------------
+motion_detector_test.dart
+  - [ ] Returns ATHLETE_ABSENT when required landmarks not detected
+  - [ ] Returns MONITORING when all landmarks detected, no velocity trigger
+  - [ ] Returns RECORDING when limb velocity exceeds LIMB_VELOCITY_THRESHOLD
+  - [ ] Returns RECORDING when shoulder rotation exceeds ROTATION_THRESHOLD
+  - [ ] Returns RECORDING when hip rotation exceeds ROTATION_THRESHOLD
+  - [ ] Returns RECORDING when arm rotation exceeds ARM_ROTATION_THRESHOLD
+  - [ ] Does NOT trigger on velocity below all thresholds
+  - [ ] Resets to MONITORING after RECORDING → motion ceases
+  - [ ] Returns to ATHLETE_ABSENT immediately when landmarks lost mid-session
+
+frame_buffer_test.dart
+  - [ ] Buffer correctly stores last PRE_TRIGGER_BUFFER_SEC of frames
+  - [ ] Buffer head returns correct timestamp offset on trigger
+  - [ ] Buffer resets cleanly between clips
+
+clip_recorder_test.dart
+  - [ ] Clip includes pre-buffer content
+  - [ ] Clip continues for POST_TRIGGER_BUFFER_SEC after motion ends
+  - [ ] Clip saved to correct file path as .mp4
+  - [ ] Clip duration within MIN/MAX bounds
+  - [ ] Metadata written correctly (name, tags, timestamps)
+  - [ ] Short clips below MIN_CLIP_DURATION_SEC are discarded
+
+local_storage_service_test.dart
+  - [ ] Clip index persists across app restarts (mock path_provider)
+  - [ ] Clip deletion removes file and updates index
+  - [ ] Clip rename updates persisted metadata
+  - [ ] Clip tag add/remove updates persisted metadata
+  - [ ] Empty gallery state handled gracefully
+
+permission_handler_service_test.dart
+  - [ ] Correct permissions requested per platform
+  - [ ] Denied permission surfaces correct error state
+
+5.2 Widget Tests (test/widgets/)
+---------------------------------
+  - [ ] Tutorial renders correct number of steps
+  - [ ] Tutorial "Get Started" navigates to Camera Monitor
+  - [ ] Camera preview shows "Step into frame" in ATHLETE_ABSENT state
+  - [ ] Camera preview shows "Monitoring..." badge in MONITORING state
+  - [ ] Camera preview shows "● REC" badge in RECORDING state
+  - [ ] Gallery renders empty state when no clips exist
+  - [ ] Clip tile shows name, tags, duration, thumbnail, timestamp
+  - [ ] Rename/tag bottom sheet saves correctly from gallery
+  - [ ] Rename/tag bottom sheet saves correctly from playback screen
+  - [ ] Settings screen persists all configurable values after restart
+
+5.3 Integration Tests (integration_test/)
+------------------------------------------
+  - [ ] First launch: tutorial shown, mandatory, leads to camera screen
+  - [ ] Full flow: monitor → athlete enters frame → movement triggers recording
+        → clip with pre/post buffer appears in gallery
+  - [ ] Athlete leaves frame mid-session → ATHLETE_ABSENT state → returns →
+        MONITORING resumes
+  - [ ] Gallery: tap clip → video plays
+  - [ ] Gallery: long-press → rename/tag → updates reflected in tile
+  - [ ] Playback: edit button → rename/tag → updates reflected on return
+  - [ ] Delete: confirm → clip removed from gallery and file system
+  - [ ] Settings changes persist after app restart
+  - [ ] Tutorial re-accessible from Settings
+
+5.4 Device / Manual Testing
+-----------------------------
+Test on:
+  - iOS physical device (simulator won't work for camera)
+  - Android physical device (API 26+)
+
+Scenarios:
+  - [ ] Full-body detection: partial body (e.g. only torso) does NOT trigger
+  - [ ] All trigger types: punch, golf swing, baseball swing, Olympic lift —
+        each fires at default sensitivity
+  - [ ] Pre-buffer: clip begins visibly before the movement peak
+  - [ ] Post-buffer: clip continues visibly after movement ends
+  - [ ] Low light: motion detection degrades gracefully, no crash
+  - [ ] Multiple consecutive movements: each generates a separate clip
+  - [ ] Battery: monitor 30 min, drain is acceptable
+  - [ ] Background: monitoring pauses when app backgrounded, resumes on return
+
+--------------------------------------------------------------------------------
+6. OUT OF SCOPE (v1)
+--------------------------------------------------------------------------------
+
+- Cloud sync or upload
+- AI-powered form feedback / coaching tips
+- Rear camera support
+- Multi-athlete detection
+- Slow-motion capture
+- Social sharing
+
+--------------------------------------------------------------------------------
+7. RESOLVED DECISIONS
+--------------------------------------------------------------------------------
+
+1. Pose detection: Use google_mlkit_pose_detection. Do NOT use tflite_flutter
+   or MoveNet.
+
+2. Background monitoring: Disabled. Pause camera and halt detection when
+   backgrounded. Resume automatically on foreground.
+
+3. Video format: .mp4 (Flutter camera default). No conversion needed.
+
+4. Storage limit: None in v1. User clears manually via Settings.
+
+5. Motion trigger method: Velocity-based only (joint/limb angular and linear
+   velocity from MLKit pose landmarks). No force detection.
+
+6. Athlete-in-frame: ALL major landmarks must be detected before triggering
+   is enabled. Partial body = ATHLETE_ABSENT state.
+
+7. Pre/post buffer: Default 1.5s each, both user-configurable in Settings.
+
+8. Clip rename & tags: Free-form text. Available from both gallery
+   (long-press) and playback screen (edit button).
+
+9. Tutorial: Mandatory on first launch, not skippable. Re-accessible
+   from Settings.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
